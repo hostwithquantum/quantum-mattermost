@@ -1,0 +1,182 @@
+# Mattermost on Docker Swarm (Planetary Quantum / luzilla)
+#
+# - TLS terminated by quantum-caddy at the edge (labels below).
+# - All persistent data lives in named Docker volumes (no bind mounts).
+# - One-off jobs fix volume ownership and create the S3 bucket before the
+#   app starts.
+#
+# Deploy:  quantum-cli stack deploy ... (see README)
+
+services:
+  # ---------------------------------------------------------------------------
+  # One-off init job. Runs once per deploy, fixes ownership on the named
+  # volumes (Mattermost runs as uid:gid 2000:2000), then exits.
+  # restart_policy: none -> Swarm does not keep restarting it after it exits 0.
+  # ---------------------------------------------------------------------------
+  setup:
+    image: alpine:3.21
+    # Script is inlined (quantum-cli stack deploy does not support configs).
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        echo "==> fixing ownership on mattermost volumes (2000:2000)"
+        for dir in /mattermost/config /mattermost/data /mattermost/logs \
+                   /mattermost/plugins /mattermost/client/plugins \
+                   /mattermost/bleve-indexes; do
+          mkdir -p "$$dir"
+          chown -R 2000:2000 "$$dir"
+          echo "    ok  $$dir"
+        done
+        echo "==> waiting for postgres at postgres:5432"
+        i=0
+        until nc -z postgres 5432 2>/dev/null; do
+          i=$$((i + 1))
+          [ "$$i" -ge 60 ] && { echo "    postgres unreachable after 60 tries" >&2; exit 1; }
+          sleep 2
+        done
+        echo "==> setup complete"
+    volumes:
+      - mm-config:/mattermost/config
+      - mm-data:/mattermost/data
+      - mm-logs:/mattermost/logs
+      - mm-plugins:/mattermost/plugins
+      - mm-client-plugins:/mattermost/client/plugins
+      - mm-bleve:/mattermost/bleve-indexes
+    networks:
+      - lan
+    deploy:
+      restart_policy:
+        condition: none
+      placement:
+        constraints:
+          - node.role == manager
+
+  # ---------------------------------------------------------------------------
+  # One-off bucket job. Creates the S3 bucket if it does not exist, then exits.
+  # Uses the minio client (mc) against the S3-compatible endpoint.
+  # restart_policy: none -> runs once per deploy.
+  # ---------------------------------------------------------------------------
+  createbucket:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        echo "==> ensuring bucket '$$S3_BUCKET' exists at $$S3_ENDPOINT"
+        mc alias set s3 "https://$$S3_ENDPOINT" "$$S3_ACCESS_KEY" "$$S3_SECRET_KEY"
+        mc mb --ignore-existing "s3/$$S3_BUCKET"
+        echo "==> bucket ready"
+    environment:
+      - "S3_BUCKET=${S3_BUCKET}"
+      - "S3_ENDPOINT=${S3_ENDPOINT}"
+      - "S3_ACCESS_KEY=${S3_ACCESS_KEY}"
+      - "S3_SECRET_KEY=${S3_SECRET_KEY}"
+    networks:
+      - lan
+    deploy:
+      restart_policy:
+        condition: none
+      placement:
+        constraints:
+          - node.role == manager
+
+  postgres:
+    image: postgres:18-alpine
+    read_only: true
+    volumes:
+      # postgres 18+ stores data in a version subdir; mount the parent.
+      - mm-db:/var/lib/postgresql
+      - type: tmpfs
+        target: /tmp
+      - type: tmpfs
+        target: /var/run/postgresql
+    environment:
+      - "TZ=UTC"
+      - "POSTGRES_USER=mmuser"
+      - "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}"
+      - "POSTGRES_DB=mattermost"
+    networks:
+      - lan
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mmuser -d mattermost"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    deploy:
+      resources:
+        limits:
+          memory: 16G
+      restart_policy:
+        condition: any
+      placement:
+        constraints:
+          - node.role == manager
+
+  mattermost:
+    image: mattermost/mattermost-team-edition:${MATTERMOST_IMAGE_TAG}
+    volumes:
+      - mm-config:/mattermost/config:rw
+      - mm-data:/mattermost/data:rw
+      - mm-logs:/mattermost/logs:rw
+      - mm-plugins:/mattermost/plugins:rw
+      - mm-client-plugins:/mattermost/client/plugins:rw
+      - mm-bleve:/mattermost/bleve-indexes:rw
+    environment:
+      - "TZ=UTC"
+      - "MM_SQLSETTINGS_DRIVERNAME=postgres"
+      - "MM_SQLSETTINGS_DATASOURCE=postgres://mmuser:${POSTGRES_PASSWORD}@postgres:5432/mattermost?sslmode=disable&connect_timeout=10"
+      - "MM_BLEVESETTINGS_INDEXDIR=/mattermost/bleve-indexes"
+      # set to `true` and flip after first deploy
+      - "MM_TEAMSETTINGS_ENABLEOPENSERVER=false"
+      - "MM_SERVICESETTINGS_SITEURL=https://${DOMAIN}"
+      # File storage on Quantum S3-compatible object storage.
+      - "MM_FILESETTINGS_DRIVERNAME=amazons3"
+      - "MM_FILESETTINGS_AMAZONS3BUCKET=${S3_BUCKET}"
+      - "MM_FILESETTINGS_AMAZONS3REGION=${S3_REGION}"
+      - "MM_FILESETTINGS_AMAZONS3ENDPOINT=${S3_ENDPOINT}"
+      - "MM_FILESETTINGS_AMAZONS3ACCESSKEYID=${S3_ACCESS_KEY}"
+      - "MM_FILESETTINGS_AMAZONS3SECRETACCESSKEY=${S3_SECRET_KEY}"
+      - "MM_FILESETTINGS_AMAZONS3SSL=true"
+      # SMTP (email invites, password reset, notifications). Uncomment and set
+      # SMTP_USERNAME / SMTP_PASSWORD in .envrc to enable.
+      # - "MM_EMAILSETTINGS_SMTPSERVER=smtp.example.com"
+      # - "MM_EMAILSETTINGS_SMTPPORT=587"
+      # - "MM_EMAILSETTINGS_SMTPUSERNAME=${SMTP_USERNAME}"
+      # - "MM_EMAILSETTINGS_SMTPPASSWORD=${SMTP_PASSWORD}"
+      # - "MM_EMAILSETTINGS_CONNECTIONSECURITY=STARTTLS"
+      # - "MM_EMAILSETTINGS_SENDEMAILNOTIFICATIONS=true"
+    networks:
+      - lan
+      - public
+    labels:
+      caddy: ${DOMAIN}
+      caddy.reverse_proxy: "{{upstreams 8065}}"
+    deploy:
+      labels:
+        caddy: ${DOMAIN}
+        caddy.reverse_proxy: "{{upstreams 8065}}"
+      resources:
+        limits:
+          memory: 4G
+      restart_policy:
+        condition: any
+      placement:
+        constraints:
+          - node.role == manager
+
+networks:
+  public:
+    external: true
+  lan:
+    driver: overlay
+    attachable: false
+
+volumes:
+  mm-db:
+  mm-config:
+  mm-data:
+  mm-logs:
+  mm-plugins:
+  mm-client-plugins:
+  mm-bleve:
